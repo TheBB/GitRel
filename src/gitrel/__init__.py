@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tarfile
 from pathlib import Path
-from typing import Annotated, Any, Self
 from subprocess import run
+from typing import Annotated, Any
 
 import click
 import httpx
 import inquirer
 from github import Auth, Github
-from pydantic import BaseModel, BeforeValidator, Field, field_validator, field_serializer
+from pydantic import BaseModel, BeforeValidator, Field, field_serializer, field_validator
 from semantic_version import Version
 from tqdm import tqdm
 from xdg_base_dirs import xdg_config_home, xdg_data_home
@@ -127,7 +128,11 @@ def main(ctx: click.Context) -> None:
 
 @main.command
 def list() -> None:
-    print("Hello there")
+    state = State.load()
+    for package in state.packages.values():
+        print(f"{package.repo} @ {package.current_version}")
+        for binary in package.binaries:
+            print(f"    {binary}")
 
 
 @main.command
@@ -234,8 +239,28 @@ def install(ctx: click.Context, repo_name: GithubRepo) -> None:
 
 
 @main.command
-def remove() -> None:
-    pass
+@click.argument("name", type=str)
+def remove(name: str) -> None:
+    state = State.load()
+
+    package_name = state.binary_to_package.get(name, name)
+
+    if package_name not in state.packages:
+        print(f"Repo {package_name} not installed")
+        sys.exit(1)
+
+    package = state.packages[package_name]
+    for binary in package.binaries:
+        (BIN / binary).unlink()
+        del state.binary_to_package[binary]
+
+    shutil.rmtree(STORE / package.store_path)
+
+    binaries = ', '.join(package.binaries)
+    print(f"Uninstalled binaries: {binaries}")
+
+    del state.packages[package_name]
+    state.save()
 
 
 @main.command
