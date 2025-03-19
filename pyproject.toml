@@ -30,6 +30,7 @@ dev = [
     "mypy>=1.15.0",
     "pytest>=8.3.5",
     "ruff>=0.11.0",
+    "types-tqdm>=4.67.0.20250319",
 ]
 
 [tool.mypy]
@@ -41,10 +42,11 @@ no_implicit_optional = true
 check_untyped_defs = true
 warn_return_any = true
 show_error_codes = true
+mypy_path = "$MYPY_CONFIG_FILE_DIR/stubs"
 
 [tool.ruff]
 line-length = 110
-include = ["src/**/*.py", "tests/**/*.py"]
+include = ["src/**/*.py", "tests/**/*.py", "stubs/**/*.pyi"]
 
 [tool.ruff.lint]
 select = [

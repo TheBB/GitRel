@@ -1,29 +1,28 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tarfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from subprocess import run
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import click
 import httpx
 import inquirer
 from github import Auth, Github
-from pydantic import BaseModel, BeforeValidator, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 from semantic_version import Version
 from tqdm import tqdm
 from xdg_base_dirs import xdg_config_home, xdg_data_home
 
-BIN = Path.home() / ".local" / "bin"
-DATA = xdg_data_home() / "gitrel"
-STORE = DATA / "store"
-CONFIG = xdg_config_home() / "gitrel"
-
-STORE.mkdir(parents=True, exist_ok=True)
-CONFIG.mkdir(parents=True, exist_ok=True)
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from types import TracebackType
 
 
 def parse_version(input: str) -> Version:
@@ -36,22 +35,204 @@ def is_executable(path: Path) -> bool:
     return b"executable" in output.stdout
 
 
-PdVersion = Annotated[Version, BeforeValidator(parse_version)]
+def ignore_file(name: str) -> bool:
+    name = name.lower()
+    return name.endswith(".md") or name in ["license"]
 
 
-class GithubRepo(BaseModel):
-    org: str
-    repo: str
+@dataclass(slots=True)
+class VersionConstraint(ABC):
+    bound: Version
 
-    def __str__(self) -> str:
-        return f"{self.org}/{self.repo}"
+    @abstractmethod
+    def matches(self, version: Version) -> bool: ...
 
-    def store_path(self) -> str:
-        return f"{self.org}-{self.repo}"
+
+class VersionHigher(VersionConstraint):
+    def matches(self, version: Version) -> bool:
+        return version > self.bound
+
+
+class VersionLower(VersionConstraint):
+    def matches(self, version: Version) -> bool:
+        return version < self.bound
+
+
+class VersionHigherOrEqual(VersionConstraint):
+    def matches(self, version: Version) -> bool:
+        return version >= self.bound
+
+
+class VersionLowerOrEqual(VersionConstraint):
+    def matches(self, version: Version) -> bool:
+        return version <= self.bound
+
+
+class VersionEqual(VersionConstraint):
+    def matches(self, version: Version) -> bool:
+        return version == self.bound
+
+
+class Manager:
+    bin_path: Path = Path.home() / ".local" / "bin"
+    data_path: Path = xdg_data_home() / "gitrel"
+    store_path: Path = data_path / "store"
+    config_path: Path = xdg_config_home() / "gitrel"
+
+    config: Config
+    github: Github
+    state: State
+
+    def __init__(self) -> None:
+        self.store_path.mkdir(parents=True, exist_ok=True)
+        self.config_path.mkdir(parents=True, exist_ok=True)
+
+        with (self.config_path / "config.json").open("r") as f:
+            self.config = Config.model_validate_json(f.read())
+        self.github = self.config.github()
+
+    def __enter__(self) -> Self:
+        with (self.data_path / "state.json").open("r") as f:
+            self.state = State.model_validate_json(f.read())
+        return self
+
+    def __exit__(
+        self,
+        type_: type[BaseException] | None,
+        value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        with (self.data_path / "state.json").open("w") as f:
+            f.write(self.state.model_dump_json())
+
+    def installed_packages(self) -> Iterator[Package]:
+        yield from self.state.packages.values()
+
+    def get_package(self, binary_or_package: str) -> Package:
+        if binary_or_package in self.state.binary_to_package:
+            return self.state.packages[self.state.binary_to_package[binary_or_package]]
+        return self.state.packages[binary_or_package]
+
+    def versions(self, spec: PackageSpec) -> list[tuple[int | str, Version]]:
+        repo = self.github.get_repo(str(spec.repo))
+
+        try:
+            releases = list(repo.get_releases())
+        except StopIteration:
+            print(f"Unable to find any releases for {repo}", file=sys.stderr)
+            sys.exit(1)
+
+        versions: list[tuple[int | str, Version]] = []
+        for release in releases:
+            try:
+                version = Version.coerce(release.title.removeprefix("v"))
+            except ValueError:
+                continue
+            if all(constraint.matches(version) for constraint in spec.constraints):
+                versions.append((release.id, version))
+
+        return versions
+
+    def install(
+        self,
+        repo_name: GithubRepo,
+        version: Version,
+        release_id: int | str,
+        preferred_asset: str | None = None,
+        uninstall_existing: bool = False,
+    ) -> None:
+        repo = self.github.get_repo(str(repo_name))
+        release = repo.get_release(release_id)
+
+        # Pick which release asset to use
+        assets = {asset.name: asset for asset in release.assets}
+        if preferred_asset and preferred_asset in assets:
+            asset = assets[preferred_asset]
+        else:
+            if preferred_asset:
+                print(f"Unable to find asset {preferred_asset}")
+            answer = inquirer.prompt(
+                [
+                    inquirer.List(
+                        "asset_name",
+                        message="Which asset to use?",
+                        choices=assets.keys(),
+                    )
+                ]
+            )
+
+            assert answer is not None, "Aborting"
+            asset = assets[answer["asset_name"]]
+
+        # Download asset to temp path
+        temp_path = self.store_path / "temp"
+        temp_store_path = self.store_path / f"NEW-{repo_name.store_path()}"
+        final_store_path = self.store_path / repo_name.store_path()
+
+        with (
+            httpx.stream("GET", asset.browser_download_url, follow_redirects=True) as r,
+            tqdm(desc="Downloading", total=asset.size, unit="B", unit_scale=True) as p,
+            temp_path.open("wb") as f,
+        ):
+            for chunk in r.iter_bytes():
+                p.update(len(chunk))
+                f.write(chunk)
+
+        # Interpret asset file
+        try:
+            if asset.name.endswith(".tar.gz"):
+                with tarfile.open(temp_path) as t:
+                    candidates = [member.name for member in t.getmembers() if not ignore_file(member.name)]
+                    t.extractall(path=temp_store_path)
+            else:
+                assert False, "Unable to understand asset file"
+        finally:
+            temp_path.unlink()
+
+        # Find binaries
+        try:
+            candidates = [c for c in candidates if is_executable(temp_store_path / c)]
+            assert candidates, "Unable to find any binaries"
+        except:
+            shutil.rmtree(temp_store_path)
+            raise
+
+        # Uninstall existing package if required
+        if uninstall_existing:
+            try:
+                self.uninstall(self.state.packages[str(repo_name)])
+            except:
+                shutil.rmtree(temp_store_path)
+                raise
+
+        # Replace store path
+        shutil.move(temp_store_path, final_store_path)
+
+        package = Package(
+            repo=repo_name,
+            current_version=version,
+            installed_from_filename=asset.name,
+            store_path=repo_name.store_path(),
+        )
+
+        for c in candidates:
+            os.symlink(final_store_path / c, self.bin_path / c)
+            package.binaries.append(c)
+            self.state.binary_to_package[c] = str(repo_name)
+
+        self.state.packages[str(repo_name)] = package
+
+    def uninstall(self, package: Package) -> None:
+        for binary in package.binaries:
+            (self.bin_path / binary).unlink()
+            del self.state.binary_to_package[binary]
+
+        shutil.rmtree(self.store_path / package.store_path)
+        del self.state.packages[str(package.repo)]
 
 
 class Package(BaseModel, arbitrary_types_allowed=True):
-    binaries: list[str]
+    binaries: list[str] = Field(default=[])
     repo: GithubRepo
     current_version: Version
     installed_from_filename: str
@@ -74,20 +255,6 @@ class State(BaseModel):
     packages: dict[str, Package] = Field(default_factory=dict)
     binary_to_package: dict[str, str] = Field(default_factory=dict)
 
-    @staticmethod
-    def load() -> State:
-        path = DATA / "state.json"
-        if not path.exists():
-            return State()
-        with path.open("r") as f:
-            data = f.read()
-        return State.model_validate_json(data)
-
-    def save(self):
-        path = DATA / "state.json"
-        with path.open("w") as f:
-            f.write(self.model_dump_json())
-
 
 class Config(BaseModel):
     token: str
@@ -97,172 +264,140 @@ class Config(BaseModel):
         return Github(auth=auth)
 
 
-class OrgRepo(click.ParamType):
+class GithubRepo(BaseModel):
+    org: str
+    repo: str
+
+    def __str__(self) -> str:
+        return f"{self.org}/{self.repo}"
+
+    def store_path(self) -> str:
+        return f"{self.org}-{self.repo}"
+
+
+@dataclass
+class PackageSpec:
+    repo: GithubRepo
+    constraints: list[VersionConstraint] = field(default_factory=list)
+
+
+class PackageSpecType(click.ParamType):
     name = "org/repo"
 
-    def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> GithubRepo:
+    def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> PackageSpec:
         try:
             assert isinstance(value, str)
-            org, repo = value.split("/")
-            assert org and repo
-            return GithubRepo(org=org, repo=repo)
+            version_pattern = Version.partial_version_re.pattern[1:-1]
+            regex = rf"^(?P<org>[\w-]+)/(?P<repo>[\w-]+)(?P<constraints>((@|>|<|>=|<=){version_pattern})*)$"
+            match = re.match(regex, value)
+            assert match is not None
+
+            spec = PackageSpec(repo=GithubRepo(org=match.group("org"), repo=match.group("repo")))
+
+            constraints = match["constraints"]
+            while constraints:
+                match = re.match(
+                    rf"^(?P<operator>(@|\>|\<|>=|<=))(?P<version>{version_pattern})", constraints
+                )
+                assert match is not None
+                constraints = constraints[match.end() :]
+
+                version = Version.coerce(match.group("version"))
+                match match.group("operator"):
+                    case ">":
+                        spec.constraints.append(VersionHigher(version))
+                    case "<":
+                        spec.constraints.append(VersionLower(version))
+                    case ">=":
+                        spec.constraints.append(VersionHigherOrEqual(version))
+                    case "<=":
+                        spec.constraints.append(VersionLowerOrEqual(version))
+                    case "@":
+                        spec.constraints.append(VersionEqual(version))
+
+            return spec
         except (ValueError, AssertionError):
             self.fail(f"{value!r} is not a valid github repo string", param, ctx)
 
 
 @click.group
-@click.pass_context
-def main(ctx: click.Context) -> None:
-    path = CONFIG / "config.json"
+def main() -> None:
+    path = Manager.config_path / "config.json"
     if not path.exists():
         token = input("Access token: ").strip()
         config = Config(token=token)
         with path.open("w") as f:
             f.write(config.model_dump_json())
-    else:
-        with path.open("r") as f:
-            data = f.read()
-        config = Config.model_validate_json(data)
-    ctx.obj = config
+
+
+@main.command("list")
+def list_() -> None:
+    with Manager() as manager:
+        for package in manager.installed_packages():
+            print(f"{package.repo} @ {package.current_version}")
+            for binary in package.binaries:
+                print(f"    {binary}")
 
 
 @main.command
-def list() -> None:
-    state = State.load()
-    for package in state.packages.values():
-        print(f"{package.repo} @ {package.current_version}")
-        for binary in package.binaries:
-            print(f"    {binary}")
+@click.argument("spec", type=PackageSpecType())
+def install(spec: PackageSpec) -> None:
+    with Manager() as manager:
+        versions = manager.versions(spec)
+        if not versions:
+            print("Unable to find any matching releases", file=sys.stderr)
+            sys.exit(1)
+
+        release_id, version = versions[0]
+        print(f"Installing version {version}")
+
+        try:
+            manager.install(spec.repo, version, release_id)
+        except Exception as e:
+            print(e, file=sys.stderr)
+            sys.exit(2)
 
 
 @main.command
-@click.argument("repo_name", type=OrgRepo())
-@click.pass_context
-def install(ctx: click.Context, repo_name: GithubRepo) -> None:
-    config: Config = ctx.obj
-    github = config.github()
+@click.argument("package_name", type=str)
+def remove(package_name: str) -> None:
+    with Manager() as manager:
+        try:
+            package = manager.get_package(package_name)
+        except KeyError:
+            print(f"Package not installed: {package_name}", file=sys.stderr)
+            sys.exit(1)
 
-    repo = github.get_repo(str(repo_name))
+        manager.uninstall(package)
+        binaries = ", ".join(package.binaries)
+        print(f"Removed binaries: {binaries}")
 
-    try:
-        release = next(iter(repo.get_releases()))
-    except StopIteration:
-        print(f"Unable to find any releases for {repo}", file=sys.stderr)
-        sys.exit(1)
 
-    version_string = release.title.removeprefix("v")
-    try:
-        version = Version.coerce(version_string)
-    except ValueError:
-        print(f"Found a release, but was unable to understand the version '{version_string}", file=sys.stderr)
-        sys.exit(2)
+@main.command
+@click.argument("package_name", type=str)
+def upgrade(package_name: str) -> None:
+    with Manager() as manager:
+        try:
+            package = manager.get_package(package_name)
+        except KeyError:
+            print(f"Package not installed: {package_name}")
 
-    print(f"Using version {version}")
-    assets = {asset.name: {"url": asset.browser_download_url, "size": asset.size} for asset in release.assets}
-    answer = inquirer.prompt(
-        [
-            inquirer.List(
-                "asset",
-                message="Which asset to use?",
-                choices=assets.keys(),
+        versions = manager.versions(PackageSpec(package.repo, [VersionHigher(package.current_version)]))
+        if not versions:
+            print(f"Unable to find a newer version than current ({package.current_version})", file=sys.stderr)
+            sys.exit(0)
+
+        release_id, version = versions[0]
+        print(f"Installing version {version} over {package.current_version}")
+
+        try:
+            manager.install(
+                package.repo,
+                version,
+                release_id,
+                preferred_asset=package.installed_from_filename,
+                uninstall_existing=True,
             )
-        ]
-    )
-    if answer is None:
-        print("Aborting", file=sys.stderr)
-        sys.exit(3)
-
-    asset_name: str = answer["asset"]
-    url = assets[asset_name]["url"]
-    size = assets[asset_name]["size"]
-    temp_path = STORE / "temp"
-    store_path = STORE / repo_name.store_path()
-
-    with (
-        httpx.stream("GET", url, follow_redirects=True) as r,
-        temp_path.open("wb") as f,
-        tqdm(desc="Downloading", total=size, unit="B", unit_scale=True) as p,
-    ):
-        for chunk in r.iter_bytes():
-            p.update(len(chunk))
-            f.write(chunk)
-
-    if asset_name.endswith(".tar.gz"):
-        with tarfile.open(temp_path) as t:
-            candidates = [
-                member.name
-                for member in t.getmembers()
-                if not member.name.endswith(".md") and member.name not in ["LICENSE"]
-            ]
-            t.extractall(path=STORE / repo_name.store_path())
-
-    temp_path.unlink()
-    candidates = [c for c in candidates if is_executable(store_path / c)]
-
-    if len(candidates) < 1:
-        print("Unable to find an executable file", file=sys.stderr)
-        sys.exit(4)
-
-    if len(candidates) > 1:
-        bin_name = inquirer.prompt(
-            [
-                inquirer.List(
-                    "member",
-                    message="Which binary to use?",
-                    choices=candidates,
-                )
-            ]
-        )
-        if bin_name is None:
-            print("Aborting")
-            sys.exit(5)
-        bin_name = bin_name["member"]
-    else:
-        bin_name = candidates[0]
-
-    os.symlink(store_path / bin_name, BIN / bin_name)
-    print(f"Installed binary: {bin_name}")
-
-    state = State.load()
-    assert bin_name not in state.packages
-    state.packages[str(repo_name)] = Package(
-        binaries=[bin_name],
-        repo=repo_name,
-        current_version=version,
-        installed_from_filename=asset_name,
-        store_path=store_path.name,
-    )
-
-    state.binary_to_package[bin_name] = str(repo_name)
-
-    state.save()
-
-
-@main.command
-@click.argument("name", type=str)
-def remove(name: str) -> None:
-    state = State.load()
-
-    package_name = state.binary_to_package.get(name, name)
-
-    if package_name not in state.packages:
-        print(f"Repo {package_name} not installed")
-        sys.exit(1)
-
-    package = state.packages[package_name]
-    for binary in package.binaries:
-        (BIN / binary).unlink()
-        del state.binary_to_package[binary]
-
-    shutil.rmtree(STORE / package.store_path)
-
-    binaries = ', '.join(package.binaries)
-    print(f"Uninstalled binaries: {binaries}")
-
-    del state.packages[package_name]
-    state.save()
-
-
-@main.command
-def upgrade() -> None:
-    pass
+        except Exception as e:
+            print(e, file=sys.stderr)
+            sys.exit(2)
