@@ -4,12 +4,13 @@ import os
 import re
 import shutil
 import sys
+import stat
 import tarfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from subprocess import run
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, Literal
 
 import click
 import httpx
@@ -93,7 +94,7 @@ class Manager:
 
     def __enter__(self) -> Self:
         with (self.data_path / "state.json").open("r") as f:
-            self.state = State.model_validate_json(f.read())
+            self.state = StateLoader.construct(f.read()).finalize()
         return self
 
     def __exit__(
@@ -184,10 +185,14 @@ class Manager:
                 with tarfile.open(temp_path) as t:
                     candidates = [member.name for member in t.getmembers() if not ignore_file(member.name)]
                     t.extractall(path=temp_store_path)
+            elif is_executable(temp_path):
+                temp_store_path.mkdir()
+                temp_path.rename(temp_store_path / asset.name)
+                candidates = [asset.name]
             else:
                 assert False, "Unable to understand asset file"
         finally:
-            temp_path.unlink()
+            temp_path.unlink(missing_ok=True)
 
         # Find binaries
         try:
@@ -216,9 +221,14 @@ class Manager:
         )
 
         for c in candidates:
-            os.symlink(final_store_path / c, self.bin_path / c)
-            package.binaries.append(c)
-            self.state.binary_to_package[c] = str(repo_name)
+            print(f"Binary: {c}")
+            bin_name = input("Install as: ").strip()
+            if not bin_name:
+                continue
+            os.symlink(final_store_path / c, self.bin_path / bin_name)
+            (final_store_path / c).chmod(stat.S_IRWXU)
+            package.binaries[bin_name] = c
+            self.state.binary_to_package[bin_name] = str(repo_name)
 
         self.state.packages[str(repo_name)] = package
 
@@ -231,7 +241,7 @@ class Manager:
         del self.state.packages[str(package.repo)]
 
 
-class Package(BaseModel, arbitrary_types_allowed=True):
+class Package_V1(BaseModel, arbitrary_types_allowed=True):
     binaries: list[str] = Field(default=[])
     repo: GithubRepo
     current_version: Version
@@ -250,10 +260,67 @@ class Package(BaseModel, arbitrary_types_allowed=True):
     def serialize_version(self, value: Version) -> str:
         return str(value)
 
+    def upgrade(self) -> Package_V2:
+        data = self.model_dump()
+        data["binaries"] = {name: name for name in self.binaries}
+        return Package_V2.model_validate(data)
 
-class State(BaseModel):
-    packages: dict[str, Package] = Field(default_factory=dict)
+
+class Package_V2(BaseModel, arbitrary_types_allowed=True):
+    binaries: dict[str, str] = Field(default={})
+    repo: GithubRepo
+    current_version: Version
+    installed_from_filename: str
+    store_path: str
+
+    @field_validator("current_version", mode="before")
+    def parse_version(cls, value: Any) -> Version:
+        if isinstance(value, Version):
+            return value
+        if isinstance(value, str):
+            return Version.coerce(value)
+        raise ValueError(f"Invalid version: {value}")
+
+    @field_serializer("current_version")
+    def serialize_version(self, value: Version) -> str:
+        return str(value)
+
+
+class State_V1(BaseModel):
+    version: Literal[1]
+    packages: dict[str, Package_V1] = Field(default_factory=dict)
     binary_to_package: dict[str, str] = Field(default_factory=dict)
+
+    def upgrade(self) -> State_V2:
+        data = self.model_dump()
+        data["packages"] = {name: package.upgrade() for name, package in self.packages.items()}
+        data["version"] = 2
+        return State_V2.model_validate(data)
+
+
+class State_V2(BaseModel):
+    version: Literal[2]
+    packages: dict[str, Package_V2] = Field(default_factory=dict)
+    binary_to_package: dict[str, str] = Field(default_factory=dict)
+
+
+Package = Package_V2
+State = State_V2
+
+
+class StateLoader(BaseModel):
+    data: State_V1 | State_V2
+
+    @classmethod
+    def construct(cls, json_data: str) -> StateLoader:
+        return cls.model_validate_json(f'{{"data": {json_data}}}')
+
+    def finalize(self) -> State:
+        if isinstance(self.data, State_V2):
+            return self.data
+        if isinstance(self.data, State_V1):
+            return self.data.upgrade()
+        assert False
 
 
 class Config(BaseModel):
